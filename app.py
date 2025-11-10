@@ -11,7 +11,8 @@ import altair as alt
 
 from stock_buy import _buy
 from stock_sell import _sell
-from fake_fund_data import _fake_fund_data as fund_data
+from fund_data import load_fund_data
+
 from equity import _recompute_equity_value
 from fund_buy import _fund_buy
 from fund_sell import _fund_sell
@@ -32,6 +33,8 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.stattools import adfuller
 
+fund_data = load_fund_data()
+FUND_NAMES = list(fund_data.keys())
 # -------------------------
 # App setup & global styles
 # -------------------------
@@ -416,8 +419,12 @@ STOCK_MAP = {
 }
 
 FUND_LIST = [
-    "OP-Rohkea A", "OP-Kehittyvät markkinat A", "OP-Suomi Indeksi A",
-    "OP-Kiina A", "OP-Maailma A"
+    "OP-Korkosalkku A",
+    "OP-Kiina A",
+    "OP-Rohkea A",
+    "OP-Kehittyvät Osakemarkkinat A",
+    "OP-Maailma Indeksi A",
+    "OP-Suomi Indeksi A",
 ]
 
 def render_page4():
@@ -779,50 +786,97 @@ def render_stock_subpage1():
         st.session_state.page = "page4"
         st.rerun()
         
-def render_sell_subpage(SELL_FEE: float = 5.0, FUND_SELL_FEE: float = 5.0, title: str = "Sell Assets"):
+def _get_latest_fund_nav(symbol: str) -> float | None:
+    """Return latest NAV for a fund from real Excel data."""
+    fd = fund_data.get(symbol)
+    if not fd:
+        return None
+
+    # Prefer explicit latest_nav if present
+    latest = fd.get("latest_nav")
+    if latest is not None:
+        try:
+            return float(latest)
+        except Exception:
+            pass
+
+    # Fallback to last row of nav DataFrame
+    nav = fd.get("nav")
+    if nav is not None and not nav.empty and "navPerShare" in nav.columns:
+        try:
+            return float(nav["navPerShare"].iloc[-1])
+        except Exception:
+            pass
+
+    return None
+
+
+def render_sell_subpage(
+    SELL_FEE: float = 5.0,
+    FUND_SELL_FEE: float = 5.0,
+    title: str = "Sell Assets", ):
+
     st.header(title)
 
-    # Totals
+    # ---------- Totals (uses real fund data via _recompute_equity_value) ----------
     _recompute_equity_value()
+
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Current Amount (Cash)", f"€{float(st.session_state.get('cash_balance', 0.0)) :,.2f}")
+        st.metric(
+            "Current Amount (Cash)",
+            f"€{float(st.session_state.get('cash_balance', 0.0)) :,.2f}",
+        )
     with c2:
-        st.metric("Equity (Stocks + Funds)", f"€{float(st.session_state.get('equity_value', 0.0)) :,.2f}")
+        st.metric(
+            "Equity (Stocks + Funds)",
+            f"€{float(st.session_state.get('equity_value', 0.0)) :,.2f}",
+        )
     with c3:
-        st.metric("Realized Profit (Total)", f"€{float(st.session_state.get('profit_value', 0.0)) :,.2f}")
+        st.metric(
+            "Realized Profit (Total)",
+            f"€{float(st.session_state.get('profit_value', 0.0)) :,.2f}",
+        )
 
-    # Build combined table
+    # ---------- Combined holdings table ----------
     df = _build_sell_table_all()
     if df.empty:
         st.info("You don’t own any assets yet. Buy stocks or funds first.")
         if st.button("← Back to Investment Options"):
-                st.session_state.page = "page4"
-                st.rerun()
+            st.session_state.page = "page4"
+            st.rerun()
         return
 
     st.dataframe(
         df.set_index(["Type", "Symbol"]),
         use_container_width=True,
-        height=min(420, 40 + 32 * max(1, len(df)))
+        height=min(420, 40 + 32 * max(1, len(df))),
     )
 
-    # Selection across both asset types
+    # ---------- Select asset to sell ----------
     options = [f"{r.Type} | {r.Symbol}" for _, r in df.iterrows()]
     choice = st.selectbox("Select an asset to sell", options, key="sell_select_asset")
     atype, sym = [s.strip() for s in choice.split("|", 1)]
 
-    # Row for that asset
     row = df[(df["Type"] == atype) & (df["Symbol"] == sym)].iloc[0]
     available = float(row["Quantity"])
     last_price = float(row["Last Price"])
     avg_cost = float(row["Avg Cost"])
 
-    st.caption(f"{atype} position in {sym}: {available:,.4f} @ avg cost €{avg_cost:,.4f}")
+    # For FUNDS, override table price with latest real NAV from Excel if available
+    if atype == "FUND":
+        real_nav = _get_latest_fund_nav(sym)
+        if real_nav is not None:
+            last_price = real_nav
 
-    # Quantity input: int for STOCK, float for FUND
+    st.caption(
+        f"{atype} position in {sym}: {available:,.4f} @ avg cost €{avg_cost:,.4f}"
+    )
+
+    # ---------- Quantity input ----------
     qkey = f"qty_sell_{atype}_{sym}"
     col1, col2 = st.columns([1, 1])
+
     with col1:
         if atype == "STOCK":
             st.number_input(
@@ -834,7 +888,7 @@ def render_sell_subpage(SELL_FEE: float = 5.0, FUND_SELL_FEE: float = 5.0, title
                 key=qkey,
             )
             qty_sell = int(st.session_state.get(qkey, 0))
-        else:
+        else:  # FUND
             st.number_input(
                 "Units to sell",
                 min_value=0.0,
@@ -846,13 +900,15 @@ def render_sell_subpage(SELL_FEE: float = 5.0, FUND_SELL_FEE: float = 5.0, title
             )
             qty_sell = float(st.session_state.get(qkey, 0.0))
 
+    # Use current market/NAV price (stocks: from table; funds: Excel NAV override above)
     with col2:
-        trade_price = last_price  # keep market price; allow override later if desired
+        trade_price = last_price
 
-    # Preview
+    # ---------- Preview ----------
     fee = SELL_FEE if atype == "STOCK" else FUND_SELL_FEE
     gross = float(qty_sell) * float(trade_price)
     proceeds = gross - float(fee)
+
     st.write(
         f"Price: **€{trade_price:,.4f}** • "
         f"Gross: **€{gross:,.2f}** • "
@@ -860,7 +916,7 @@ def render_sell_subpage(SELL_FEE: float = 5.0, FUND_SELL_FEE: float = 5.0, title
         f"Proceeds: **€{proceeds:,.2f}**"
     )
 
-    # Confirm
+    # ---------- Confirm ----------
     if st.button(
         "Confirm Sell",
         disabled=(qty_sell == 0 or float(qty_sell) > float(available)),
@@ -874,10 +930,12 @@ def render_sell_subpage(SELL_FEE: float = 5.0, FUND_SELL_FEE: float = 5.0, title
         if res:
             realized_pl_delta, final_proceeds = res
 
-            # 🟢 accumulate realized P/L for the Summary page
-            st.session_state["realized_pl"] = float(st.session_state.get("realized_pl", 0.0)) + float(realized_pl_delta)
+            # accumulate realized P/L
+            st.session_state["realized_pl"] = float(
+                st.session_state.get("realized_pl", 0.0)
+            ) + float(realized_pl_delta)
 
-            # 1) Cache latest price for summary valuation
+            # cache latest prices for summary page valuation
             if atype == "STOCK":
                 st.session_state.setdefault("latest_stock_prices", {})
                 st.session_state["latest_stock_prices"][sym] = float(trade_price)
@@ -885,10 +943,12 @@ def render_sell_subpage(SELL_FEE: float = 5.0, FUND_SELL_FEE: float = 5.0, title
                 st.session_state.setdefault("latest_fund_prices", {})
                 st.session_state["latest_fund_prices"][sym] = float(trade_price)
 
-            # 2) Mirror your app's cash key to the helpers' default "cash"
-            st.session_state["cash"] = float(st.session_state.get("cash_balance", 0.0))
+            # mirror generic "cash" key
+            st.session_state["cash"] = float(
+                st.session_state.get("cash_balance", 0.0)
+            )
 
-            # 3) Record the transaction + snapshot portfolio history
+            # record transaction
             record_txn(
                 st,
                 side="sell",
@@ -897,17 +957,18 @@ def render_sell_subpage(SELL_FEE: float = 5.0, FUND_SELL_FEE: float = 5.0, title
                 qty=int(qty_sell) if atype == "STOCK" else float(qty_sell),
                 price=float(trade_price),
                 fee=float(SELL_FEE if atype == "STOCK" else FUND_SELL_FEE),
-                ts=dt.datetime.now()  # or use a user-selected date if you add one later
+                ts=dt.datetime.now(),
             )
 
             st.success(
                 f"Sold {qty_sell} x {sym} at €{trade_price:,.4f} • "
-                f"Proceeds: €{final_proceeds:,.2f} • Realized P/L: €{realized_pl_delta:,.2f}"
+                f"Proceeds: €{final_proceeds:,.2f} • "
+                f"Realized P/L: €{realized_pl_delta:,.2f}"
             )
-            # reset qty field for this asset
+
             st.session_state.pop(qkey, None)
 
-        # Refresh table & totals
+        # Refresh
         st.session_state.sell_view_cache = None
         _recompute_equity_value()
         st.rerun()
@@ -920,84 +981,226 @@ def render_sell_subpage(SELL_FEE: float = 5.0, FUND_SELL_FEE: float = 5.0, title
 def render_fund_subpage():
     st.header("Investment Fund Details")
 
-    # Load fake data
-    FUNDS_DATA = fund_data()  
-    fund_names = list(FUNDS_DATA.keys())
-    if not fund_names:
+    # fund_data is from real Excel:
+    # from fin_app.fund_data import load_fund_data
+    # fund_data = load_fund_data()
+    if not fund_data:
         st.error("No fund data available.")
         return
-    fund_name = st.selectbox("Select an Investment Fund", fund_names, key="fund_select")
-    fund_df = FUNDS_DATA[fund_name].copy()
+
+    # --- 1️⃣ Read selection from Page 4 ---
+    selected_label = st.session_state.get("sb_fund")  # from page4 selectbox
+
+    # Helper: map the UI label from Page 4 to a fund_data key
+    def resolve_fund_key(label: str | None) -> str | None:
+        if not label or label == "— Select —":
+            return None
+
+        # Exact match first
+        if label in fund_data:
+            return label
+
+        # Try a cleaned version (remove '(...)', trim, etc.)
+        cleaned = label.split("(")[0].strip()
+        if cleaned in fund_data:
+            return cleaned
+
+        # Loose contains / prefix match as a safety net
+        for key in fund_data.keys():
+            if cleaned == key.strip():
+                return key
+            if cleaned in key or key in cleaned:
+                return key
+
+        return None
+
+    fund_name = resolve_fund_key(selected_label)
+
+    # If still nothing, allow choosing here as a fallback so the page is usable
+    if fund_name is None:
+        fund_names = sorted(list(fund_data.keys()))
+        st.warning(
+            "Could not determine the selected fund from the previous page. "
+            "Please pick a fund below."
+        )
+        fund_name = st.selectbox(
+            "Select an Investment Fund",
+            options=fund_names,
+            key="fund_select_fallback",
+        )
+
+    # If for some reason we *still* don't have a fund, bail.
+    if not fund_name or fund_name not in fund_data:
+        st.error("No valid fund selected.")
+        if st.button("← Back to Investment Options"):
+            st.session_state.page = "page4"
+            st.rerun()
+        return
+
+    # --- 2️⃣ Use real NAV data for the resolved fund ---
+    fd = fund_data[fund_name]
+    nav_df = fd.get("nav")
+    if nav_df is None or nav_df.empty:
+        st.error(f"No NAV data available for {fund_name}.")
+        if st.button("← Back to Investment Options"):
+            st.session_state.page = "page4"
+            st.rerun()
+        return
+
+    nav_df = fd["nav"].copy()
+
+    # Expecting columns: "date", "navPerShare"
+    nav_df["Date"] = pd.to_datetime(nav_df["Date"])
+    nav_df = nav_df.sort_values("Date")
+
+    if nav_df.empty:
+        st.error("No NAV data available for this fund.")
+        return
 
     # Current amount
-    st.metric("Current Cash Balance (€)", f"{st.session_state.get('cash_balance', 0):,.2f}")
+    cash_balance = float(st.session_state.get("cash_balance", 0.0))
+    st.metric("Current Cash Balance (€)", f"{cash_balance:,.2f}")
 
-    # Date range selector
+    # Date range selector for chart
     col1, col2 = st.columns(2)
     with col1:
-        start_date = st.date_input("Start Date", fund_df["Date"].min())
+        start_date = st.date_input(
+            "Start Date",
+            value=nav_df["Date"].min().date(),
+            key=f"{fund_name}_start_date",
+        )
     with col2:
-        end_date = st.date_input("End Date", fund_df["Date"].max())
+        end_date = st.date_input(
+            "End Date",
+            value=nav_df["Date"].max().date(),
+            key=f"{fund_name}_end_date",
+        )
 
-    mask = (fund_df["Date"] >= pd.to_datetime(start_date)) & (fund_df["Date"] <= pd.to_datetime(end_date))
-    filtered = fund_df.loc[mask]
+    start_ts = pd.to_datetime(start_date)
+    end_ts = pd.to_datetime(end_date)
 
-    # Time series chart
+    if start_ts > end_ts:
+        st.error("Start Date must be before End Date.")
+        return
+
+    mask = (nav_df["Date"] >= start_ts) & (nav_df["Date"] <= end_ts)
+    filtered = nav_df.loc[mask]
+
+    if filtered.empty:
+        filtered = nav_df  # fallback to full range if filter wipes everything
+
+    # Time series chart (NAV)
     st.subheader(f"Performance of {fund_name}")
-    fig, ax = plt.subplots(figsize=(10, 2))  # width, height in inches
-    ax.plot(filtered["Date"], filtered["Price"])
-
+    fig, ax = plt.subplots(figsize=(10, 2))
+    ax.plot(filtered["Date"], filtered["navPerShare"])
     ax.set_xlabel("Date")
-    ax.set_ylabel("Fund Value (€)")
+    ax.set_ylabel("NAV per Share (€)")
     st.pyplot(fig)
-    # Fund metrics (Morning Star, Volatility, Expenses)
-    metrics = filtered.iloc[-1]
-    star_count = int(metrics["Morning_Star"])
+
+    # ---------------- Fund Metrics (from real metadata) ----------------
     st.markdown("### Fund Metrics")
+    col1, col2, col3, col4 = st.columns(4)
 
-    stars = "⭐" * star_count + "☆" * (5 - star_count)
-    col1, col2, col3 = st.columns(3)
+    # Morningstar rating
+    star_count = fd.get("morning_star")
     with col1:
-        st.metric("Morning Star Rating", stars)
+        if star_count:
+            stars = "⭐" * int(star_count) + "☆" * (5 - int(star_count))
+            st.metric("Morningstar Rating", stars)
+        else:
+            st.metric("Morningstar Rating", "N/A")
+
+    # Volatility (as %)
     with col2:
-        st.metric("Volatility", f"{metrics['Volatility']:.2f}%")
+        vol = fd.get("volatility")
+        if vol is not None:
+            # assume vol already in decimal form (e.g. 0.12 -> 12%)
+            st.metric("Volatility", f"{float(vol) * 100:.2f}%")
+        else:
+            st.metric("Volatility", "N/A")
+
+    # Operating Expenses
     with col3:
-        st.metric("Operating Expenses", f"{metrics['Expenses']:.2f}%")
+        exp = fd.get("operating_expense")
+        if exp is not None:
+            # exp assumed as percent number (e.g. 0.65 or 0.65%)
+            # If you stored 0.65 as "0.65", treat as already in %.
+            val = float(exp)
+            # If this looks like a decimal (< 1), show as %, else assume already %
+            if val < 1:
+                st.metric("Operating Expenses", f"{val * 100:.2f}%")
+            else:
+                st.metric("Operating Expenses", f"{val:.2f}%")
+        else:
+            st.metric("Operating Expenses", "N/A")
 
+    # Growth metric
+    with col4:
+        growth = fd.get("growth")
+        g_from = fd.get("growth_from_date")
+        if growth is not None:
+            # assuming growth is decimal (0.08 -> 8%)
+            label = f"{float(growth) * 100:.2f}%"
+            if g_from is not None:
+                try:
+                    g_from_dt = pd.to_datetime(g_from).date()
+                    st.metric("Growth", f"{label} (since {g_from_dt})")
+                except Exception:
+                    st.metric("Growth", label)
+            else:
+                st.metric("Growth", label)
+        else:
+            st.metric("Growth", "N/A")
 
-    # Buy
+    # ---------------- Buy Section ----------------
     st.divider()
     st.markdown("#### Buy this Fund")
 
-        # --- Get latest price row ---
-    # Use filtered date range if available, otherwise whole dataset
+    # Latest NAV as trade price (from filtered range if available)
     if not filtered.empty:
-        latest = filtered.iloc[-1]
+        latest_row = filtered.iloc[-1]
     else:
-        latest = fund_df.iloc[-1]
+        latest_row = nav_df.iloc[-1]
 
-    current_price = float(latest["Price"])
+    current_price = float(latest_row["navPerShare"])
 
     # Show current holding if any
+    st.session_state.setdefault("fund_holdings", {})
     fpos = st.session_state.fund_holdings.get(fund_name)
     if fpos and fpos.get("qty", 0) > 0:
         st.caption(
-            f"Current holding: {float(fpos['qty']):,.4f} units @ avg cost €{float(fpos['avg_cost']):,.4f}"
+            f"Current holding: {float(fpos['qty']):,.4f} units "
+            f"@ avg cost €{float(fpos.get('avg_cost', 0.0)):,.4f}"
         )
+
     # Inputs
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        invest_amount = st.number_input("Amount to invest (€)", min_value=0.0, value=0.0, step=50.0, key=f"fund_in_amt_{fund_name}")
+        invest_amount = st.number_input(
+            "Amount to invest (€)",
+            min_value=0.0,
+            value=0.0,
+            step=50.0,
+            key=f"fund_in_amt_{fund_name}",
+        )
     with c2:
-        buy_date = st.date_input("Date of investment", value=pd.Timestamp.today().date(), key=f"fund_buy_date_{fund_name}")
+        buy_date = st.date_input(
+            "Date of investment",
+            value=pd.Timestamp.today().date(),
+            key=f"fund_buy_date_{fund_name}",
+        )
     with c3:
-        FUND_BUY_FEE = 5.0  # hardcoded per BRD/prototype
+        FUND_BUY_FEE = 5.0  # per BRD
         st.text("")  # spacing
         st.caption(f"Fee per order: €{FUND_BUY_FEE:,.2f}")
 
-    # --- Derived calculations ---
-    est_units = ((invest_amount - FUND_BUY_FEE) / current_price) if invest_amount > FUND_BUY_FEE else 0.0
-    new_balance = st.session_state.cash_balance - invest_amount if invest_amount > 0 else st.session_state.cash_balance
+    # Derived calcs
+    if invest_amount > FUND_BUY_FEE:
+        est_units = (invest_amount - FUND_BUY_FEE) / current_price
+    else:
+        est_units = 0.0
+
+    new_balance = cash_balance - invest_amount if invest_amount > 0 else cash_balance
 
     st.write(
         f"Price: **€{current_price:,.2f}** • "
@@ -1005,11 +1208,11 @@ def render_fund_subpage():
         f"Cash After: **€{new_balance:,.2f}**"
     )
 
-    # --- Confirm Buy button ---
+    # Confirm Buy
     if st.button(
         f"Confirm Buy ({fund_name})",
         disabled=(invest_amount <= FUND_BUY_FEE),
-        key=f"fund_buy_btn_{fund_name}"
+        key=f"fund_buy_btn_{fund_name}",
     ):
         units = _fund_buy(
             fund_name=fund_name,
@@ -1018,27 +1221,30 @@ def render_fund_subpage():
             fee=float(FUND_BUY_FEE),
             when=buy_date,
         )
+
         if units:
-        # 1) Cache latest price for summary valuation
+            # 1) Cache latest price for summary valuation
             st.session_state.setdefault("latest_fund_prices", {})
             st.session_state["latest_fund_prices"][fund_name] = float(current_price)
 
-            # 2) Mirror your app's cash key to the helpers' default "cash"
-            st.session_state["cash"] = float(st.session_state.get("cash_balance", 0.0))
+            # 2) Sync generic "cash" with your cash_balance
+            st.session_state["cash"] = float(
+                st.session_state.get("cash_balance", cash_balance)
+            )
 
-            # 3) Build a timestamp from the chosen buy date (00:00 local)
+            # 3) Build timestamp from buy_date (00:00)
             ts = dt.datetime.combine(buy_date, dt.datetime.min.time())
 
-            # 4) Record the transaction + snapshot portfolio history
+            # 4) Record transaction for history & summary views
             record_txn(
                 st,
                 side="buy",
                 asset_class="funds",
                 symbol=fund_name,
-                qty=float(units),                 # units purchased
-                price=float(current_price),       # execution price (NAV)
+                qty=float(units),
+                price=float(current_price),
                 fee=float(FUND_BUY_FEE),
-                ts=ts
+                ts=ts,
             )
 
             st.success(
@@ -1046,11 +1252,12 @@ def render_fund_subpage():
                 f"(Invested €{invest_amount:,.2f}, Fee €{FUND_BUY_FEE:,.2f})."
             )
             st.rerun()
-            
+
     st.divider()
     if st.button("← Back to Investment Options"):
-            st.session_state.page = "page4"
-            st.rerun()
+        st.session_state.page = "page4"
+        st.rerun()
+
 
 def render_summary_page():
     ensure_state(st)
@@ -1058,33 +1265,116 @@ def render_summary_page():
     pname = st.session_state.portfolio_name or "Unnamed Portfolio"
     st.markdown(f"## {pname}")
 
+    # 1) Base holdings from your existing helper
     holdings_df = compute_holdings_df(st)
+
+    # 2) If we have holdings, overwrite FUND rows with latest NAV from real Excel data
+    if holdings_df is not None and not holdings_df.empty:
+        holdings_df = holdings_df.copy()
+
+        # Expected columns from compute_holdings_df:
+        # "Class" (e.g. STOCK / FUND), "Asset", "Qty" (or "Quantity"),
+        # "Price" (or "Last Price"), "Market Value" (or "Value"),
+        # "Avg Cost", "Unrealized P/L" (optional)
+        qty_cols = [c for c in ("Qty", "Quantity") if c in holdings_df.columns]
+        price_cols = [c for c in ("Price", "Last Price") if c in holdings_df.columns]
+        mv_cols = [c for c in ("Market Value", "Value") if c in holdings_df.columns]
+        upl_cols = [c for c in ("Unrealized P/L", "Unrealized PL") if c in holdings_df.columns]
+
+        qty_col = qty_cols[0] if qty_cols else None
+        price_col = price_cols[0] if price_cols else None
+        mv_col = mv_cols[0] if mv_cols else None
+        upl_col = upl_cols[0] if upl_cols else None
+
+        if qty_col and price_col and mv_col:
+            for idx, row in holdings_df.iterrows():
+                cls = str(row.get("Class", "")).upper()
+                if "FUND" not in cls:
+                    continue  # only adjust fund rows
+
+                fname = row.get("Asset")
+                if not fname:
+                    continue
+
+                fd = fund_data.get(fname)
+                if not fd:
+                    continue
+
+                # ---- Get latest NAV from real data ----
+                latest_nav = fd.get("latest_nav")
+                if latest_nav is None:
+                    nav_df = fd.get("nav")
+                    if (
+                        nav_df is not None
+                        and not nav_df.empty
+                        and "navPerShare" in nav_df.columns
+                    ):
+                        latest_nav = float(nav_df["navPerShare"].iloc[-1])
+
+                if latest_nav is None:
+                    continue  # if still nothing, skip
+
+                latest_nav = float(latest_nav)
+
+                # Update price
+                holdings_df.loc[idx, price_col] = latest_nav
+
+                # Update market value
+                qty = float(row.get(qty_col, 0.0))
+                mv = qty * latest_nav
+                holdings_df.loc[idx, mv_col] = mv
+
+                # Update unrealized P/L if structure is available
+                if upl_col and "Avg Cost" in holdings_df.columns:
+                    avg_cost = float(row.get("Avg Cost", 0.0))
+                    cost_val = qty * avg_cost
+                    holdings_df.loc[idx, upl_col] = mv - cost_val
+
+    # 3) Compute totals from the NAV-adjusted holdings_df
     totals = compute_totals(st, holdings_df)
 
+    # ---- Top KPIs ----
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Current Amount (Cash)", f"€{totals['cash']:,.2f}")
     k2.metric("Portfolio Value", f"€{totals['portfolio_value']:,.2f}")
     k3.metric("Realized Profit", f"€{totals['realized_pl']:,.2f}")
     k4.metric("Total Profit", f"€{totals['total_profit']:,.2f}")
 
+    # ---- Holdings table ----
     st.markdown("### Your Holdings (Stocks + Funds)")
-    st.dataframe(
-        holdings_df.sort_values(["Class","Asset"]) if not holdings_df.empty else holdings_df,
-        use_container_width=True
-    )
+    if holdings_df is not None and not holdings_df.empty:
+        st.dataframe(
+            holdings_df.sort_values(["Class", "Asset"]),
+            use_container_width=True,
+        )
+    else:
+        st.caption("No holdings yet.")
 
+    # ---- Portfolio over time ----
     st.markdown("### Portfolio Over Time")
     history = st.session_state.get("portfolio_history", [])
     if history:
-        hist_df = pd.DataFrame(history).sort_values("ts").drop_duplicates("ts", keep="last")
+        hist_df = (
+            pd.DataFrame(history)
+            .sort_values("ts")
+            .drop_duplicates("ts", keep="last")
+        )
         base = alt.Chart(hist_df).encode(x=alt.X("ts:T", title="Time"))
-        line_total = base.mark_line().encode(y=alt.Y("total_value:Q", title="Total Value (€)"))
-        line_portf = base.mark_line(strokeDash=[4,3]).encode(y="portfolio_value:Q")
-        line_cash  = base.mark_line(strokeDash=[1,2]).encode(y="cash:Q")
-        st.altair_chart(alt.layer(line_total, line_portf, line_cash), use_container_width=True)
+        line_total = base.mark_line().encode(
+            y=alt.Y("total_value:Q", title="Total Value (€)")
+        )
+        line_portf = base.mark_line(strokeDash=[4, 3]).encode(
+            y="portfolio_value:Q"
+        )
+        line_cash = base.mark_line(strokeDash=[1, 2]).encode(y="cash:Q")
+        st.altair_chart(
+            alt.layer(line_total, line_portf, line_cash),
+            use_container_width=True,
+        )
     else:
         st.info("No history yet — buy or sell something to populate the chart.")
 
+    # ---- P&L breakdown ----
     with st.expander("Detailed P&L breakdown"):
         cA, cB = st.columns(2)
         cA.write("**Unrealized P/L**")
@@ -1092,25 +1382,52 @@ def render_summary_page():
         cB.write("**Realized P/L**")
         cB.write(f"€{totals['realized_pl']:,.2f}")
 
+    # ---- Recent Transactions ----
     st.markdown("### Recent Transactions")
     txns = st.session_state.get("transactions", [])
     if txns:
-        tx_df = (pd.DataFrame(txns)
-                 .sort_values("ts", ascending=False)
-                 .assign(ts=lambda d: pd.to_datetime(d["ts"]).dt.strftime("%Y-%m-%d %H:%M"))
-                 [["ts","side","asset_class","symbol","qty","price","fee","cash_after"]]
-                 .rename(columns={
-                    "ts":"Time","side":"Side","asset_class":"Class","symbol":"Asset",
-                    "qty":"Qty","price":"Price","fee":"Fee","cash_after":"Cash After"
-                 }))
+        tx_df = (
+            pd.DataFrame(txns)
+            .sort_values("ts", ascending=False)
+            .assign(
+                ts=lambda d: pd.to_datetime(d["ts"]).dt.strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            )[
+                [
+                    "ts",
+                    "side",
+                    "asset_class",
+                    "symbol",
+                    "qty",
+                    "price",
+                    "fee",
+                    "cash_after",
+                ]
+            ]
+            .rename(
+                columns={
+                    "ts": "Time",
+                    "side": "Side",
+                    "asset_class": "Class",
+                    "symbol": "Asset",
+                    "qty": "Qty",
+                    "price": "Price",
+                    "fee": "Fee",
+                    "cash_after": "Cash After",
+                }
+            )
+        )
         st.dataframe(tx_df, use_container_width=True, height=260)
     else:
         st.caption("No transactions yet.")
 
     st.divider()
     if st.button("← Back to Investment Options"):
-            st.session_state.page = "page4"
-            st.rerun()
+        st.session_state.page = "page4"
+        st.rerun()
+
+
 # -------------------------
 # Router
 # -------------------------
